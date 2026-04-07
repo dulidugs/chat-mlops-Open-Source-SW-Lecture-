@@ -1,31 +1,86 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+import torch
+from transformers import pipeline
 
-app = FastAPI(title="1:1 Chat Helper API")
+# 1. 글로벌 변수로 텍스트 생성 파이프라인 생성 (초기값은 None)
+model_pipeline = None
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model_pipeline
+    try:
+        # 2. 앱 시작 시 한 번만 모델 로드
+        print("Loading Hugging Face model (distilgpt2)...")
+        # CPU 환경에서 동작하도록 가볍고 작은 영문 모델(distilgpt2)를 사용합니다.
+        model_pipeline = pipeline("text-generation", model="distilgpt2", device=-1)
+        print("Model loaded successfully!")
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+    yield
+    # 자원 정리
+    print("Shutting down and releasing resources.")
+    model_pipeline = None
+
+# FastAPI 인스턴스 생성
+app = FastAPI(title="1:1 Chat Helper API (MLOps Version)", lifespan=lifespan)
+
+# Pydantic BaseModel 정의
 class ChatRequest(BaseModel):
     history: list[str]
 
+# POST /predict-next 엔드포인트
 @app.post("/predict-next")
 async def predict_next(request: ChatRequest):
+    global model_pipeline
+    
     if not request.history:
         return {"next_message": "먼저 대화 내용을 입력해 주세요."}
-
-    # 전체 문맥을 하나의 문자열로 합쳐서 키워드 단어 검사 수행
-    user_context = " ".join(request.history)
-    
-    if "피곤" in user_context or "졸려" in user_context:
-        next_message = "오늘은 조금 일찍 자는 게 좋겠다."
-    elif "밥" in user_context or "배고파" in user_context or "점심" in user_context:
-        next_message = "간단하게 먹을 수 있는 걸로 먼저 챙겨 먹자."
-    elif "약속" in user_context or "시간" in user_context or "언제" in user_context:
-        next_message = "언제 시간이 괜찮은지 먼저 물어봐야겠다."
-    else:
-        next_message = "그렇구나, 조금 더 자세히 얘기해 줄 수 있어?"
         
-    return {"next_message": next_message}
+    try:
+        # a) history 리스트를 "\\n"으로 join 해서 긴 대화 context 문자열을 만든다.
+        context = "\\n".join(request.history)
+        
+        # b) context 끝에 "나:" 프롬프트를 붙여서 다음 할 말을 유도한다.
+        if not context.endswith("\\n"):
+            context += "\\n"
+        context += "나: "
+        
+        # 만약 모델 로드가 실패했다면 fallback 텍스트 반환
+        if model_pipeline is None:
+            return {"next_message": "현재 AI 모델을 사용할 수 없습니다. (Fallback: 그렇구나!)"}
+            
+        # c) Hugging Face pipeline을 이용해 생성 (max_new_tokens=30)
+        # 패딩 경고 방지를 위해 pad_token_id 설정, 입력 제한을 피하기 위해 truncation 추가
+        result = model_pipeline(
+            context,
+            max_new_tokens=30,
+            num_return_sequences=1,
+            truncation=True,
+            pad_token_id=model_pipeline.tokenizer.eos_token_id
+        )
+        
+        generated_text = result[0]['generated_text']
+        
+        # d) 입력해 준 context 부분을 잘라내고 새로 생성된 텍스트만 정리한다.
+        new_text = generated_text[len(context):]
+        
+        # 여러 줄이 생성되었을 경우 첫 번째 줄(한 줄)만 가져오고 양쪽 공백 정리
+        next_message_candidate = new_text.split("\\n")[0].strip()
+        
+        if not next_message_candidate:
+            next_message_candidate = "음... 무슨 말을 할지 고민되네."
+            
+        return {"next_message": next_message_candidate}
+        
+    except Exception as e:
+        # e) 에러 발생 시를 대비한 fallback 문장
+        print(f"Prediction Error: {e}")
+        return {"next_message": "요청을 모델로 추론하는 중 오류가 발생했습니다. (Fallback: 무슨 일 있었어?)"}
 
+# 이전에 만든 웹 UI (루트 경로 유지)
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     html_content = """<!DOCTYPE html>
@@ -130,7 +185,7 @@ async def read_root():
     
     <div class="form-group">
         <label for="chat-history">나와 상대의 대화 내역</label>
-        <textarea id="chat-history" placeholder="상대: 오늘 점심 뭐 먹을래?&#10;나: 글쎄, 너는 땡기는 거 있어?&#10;상대: 난 아무거나 괜찮아!"></textarea>
+        <textarea id="chat-history" placeholder="상대: 오늘 점심 뭐 먹을래?\\n나: 글쎄, 너는 땡기는 거 있어?\\n상대: 난 아무거나 괜찮아!"></textarea>
     </div>
     
     <button id="predict-btn" onclick="predictNext()">내 다음 말 추천받기</button>
@@ -157,7 +212,7 @@ async function predictNext() {
     resultContainer.style.display = 'none';
     
     try {
-        // POST 요청으로 history 배열 전송
+        // POST 요청으로 history 배열 전송 (상대경로 활용)
         const response = await fetch("/predict-next", {
             method: "POST",
             headers: {
