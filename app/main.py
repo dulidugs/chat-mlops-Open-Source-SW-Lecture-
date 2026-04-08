@@ -6,6 +6,13 @@ import torch
 import re
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# [모델 및 토크나이저 상수 명시]
+# 모델 이름과 프롬프트를 이렇게 지정한 이유:
+# base 모델(skt/kogpt2-base-v2)은 사람 간의 대화보다는 위키/문서 형태의 텍스트 생성에 맞춰져 있어 단순 채팅맥락을 이어나가기엔 한계가 있습니다.
+# 이를 대신해, base 모델을 바탕으로 대화/명령(instruction) 데이터셋을 학습시킨 'KoAlpaca' 계열 같은 Chat 전용 모델을 사용하면 
+# "사용자: ~ 봇: ~" 형태의 핑퐁 대화 구조를 명확히 이해하고, 답변을 훨씬 자연스럽고 알맞게 생성해낼 수 있습니다.
+MODEL_NAME = "beomi/KoAlpaca-Polyglot-1.3B"  # 한국어 대화형 모델 (CPU/Local에서 돌릴 수 있는 1.3B 파라미터 경량 챗봇 모델)
+
 # 전역 변수로 토크나이저와 모델 선언
 tokenizer = None
 model = None
@@ -14,19 +21,19 @@ model = None
 async def lifespan(app: FastAPI):
     global tokenizer, model
     try:
-        print("Loading Hugging Face model (skt/kogpt2-base-v2)...")
-        tokenizer = AutoTokenizer.from_pretrained("skt/kogpt2-base-v2")
-        model = AutoModelForCausalLM.from_pretrained("skt/kogpt2-base-v2")
+        print(f"Loading Hugging Face Chat model ({MODEL_NAME})...")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
         
-        # 모델 재생성시 pad_token_id가 없으면 발생하는 경고를 피하기 위해 설정
-        # debug changed: pad_token_id와 eos_token_id 확인
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             
-        # GPU 사용 가능 시 cuda로 이동
         if torch.cuda.is_available():
             model.to("cuda")
             
+        # 추론용 평가 모드로 전환
+        model.eval()
+        
         print("Model loaded successfully!")
     except Exception as e:
         print(f"Failed to load model: {e}")
@@ -35,7 +42,7 @@ async def lifespan(app: FastAPI):
     tokenizer = None
     model = None
 
-app = FastAPI(title="1:1 Chat Helper API (KoGPT2)", lifespan=lifespan)
+app = FastAPI(title="1:1 Chat Helper API (KoAlpaca Chat)", lifespan=lifespan)
 
 class ChatRequest(BaseModel):
     history: list[str]
@@ -48,66 +55,66 @@ async def predict_next(request: ChatRequest):
         return {"next_message": "먼저 대화 내용을 입력해 주세요."}
         
     try:
-        context = "\\n".join(request.history)
-        if not context.endswith("\\n"):
-            context += "\\n"
-        context += "나:"
+        # [프롬프트 변환 로직]
+        # "나: ..." -> "사용자: ..."
+        # "상대: ..." -> "봇: ..."
+        converted_history = []
+        for line in request.history:
+            if line.startswith("나:"):
+                converted_history.append("사용자: " + line[len("나:"):].strip())
+            elif line.startswith("상대:"):
+                converted_history.append("봇: " + line[len("상대:"):].strip())
+            else:
+                converted_history.append(line)
+                
+        # 대화형 모델에 맞는 프롬프트 템플릿 구성
+        prompt = "사용자와 챗봇의 대화가 아래와 같다.\\n\\n"
+        prompt += "\\n".join(converted_history)
+        if not prompt.endswith("\\n"):
+            prompt += "\\n"
+        # 최종적으로 "내가 다음에 할 말"을 모델이 유추하게 만드므로, "사용자:"를 끝에 배치하여 생성을 유도함.
+        prompt += "사용자:"
         
         if model is None or tokenizer is None:
             return {"next_message": "현재 AI 모델을 사용할 수 없습니다."}
             
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        inputs = tokenizer(context, return_tensors="pt").to(device)
-        
-        # debug changed: 토큰 길이 기준 자르기를 위해 input_ids의 길이를 저장
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
         input_ids_length = inputs["input_ids"].shape[1]
         
-        # debug changed: skt/kogpt2-base-v2 모델의 특성
-        # 해당 모델은 'base' 모델이므로 채팅 형태나 zero-shot Instruction 명령에 약합니다.
-        # 따라서 확률 기반 생성을 할 때 대화 흐름을 잃고 이상한 문자를 뱉을 확률이 있습니다.
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=30,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.9,
-            repetition_penalty=1.2,
-            no_repeat_ngram_size=2,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
-        )
+        # evaluation 모드에서 no_grad()로 그래디언트 연산 해제 후 추론
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=20,          # 과도하게 긴 말뭉치 방지
+                do_sample=True,
+                temperature=0.7,            # 너무 높으면 이상한 말 가능성 상승
+                top_p=0.85, 
+                repetition_penalty=1.2,     # 같은 단어 반복 방지
+                no_repeat_ngram_size=2,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
         
-        # debug changed: 기존에는 전체 문장을 decode한 후 문자열 크기 len(context)로 잘랐지만,
-        # 공백이나 특수 토큰 처리 불일치로 인해 문자가 중간에 비정상적으로 잘리며 깨지는 원인이 되었습니다.
-        # 따라서 생성된 토큰 배열에서 입력된 부분만 제외하고 새 토큰만 분리한 후 decode 합니다.
+        # 모델 출력물에서 "새로 만들어진 토큰"만 디코드 수행
         new_token_ids = outputs[0][input_ids_length:]
         new_text = tokenizer.decode(new_token_ids, skip_special_tokens=True)
         
         # 첫 번째 줄바꿈 전까지만 남기기
         next_message_candidate = new_text.split("\\n")[0].strip()
         
-        # 간혹 "나:" 또는 유사한 접두사가 다시 생성된 경우 제거
-        if next_message_candidate.startswith("나:"):
-            next_message_candidate = next_message_candidate[2:].strip()
-            
-        # debug changed: 약한 디버깅 보호 로직 (명백한 깨짐만 방어)
-        # 생성된 문자열에 한글이 거의 없고 특수문자나 알파벳만 가득하다면 깨진 것으로 간주합니다.
-        hangul_chars = re.findall(r'[가-힣]', next_message_candidate)
-        if len(next_message_candidate) > 5 and (len(hangul_chars) / len(next_message_candidate)) < 0.2:
-            print(f"[Warning] 한글 비율 낮음 (깨짐 의심): {next_message_candidate}")
-            next_message_candidate = "..."  # 디버깅 단계이므로 최소한의 반환
-            
-        # debug changed: 서버 콘솔에 원본 토큰 등 자세한 디버깅 정보 출력
+        # 접두사 중복 생성 제거 (사용자:, 봇:, 나:)
+        for prefix in ["사용자:", "봇:", "나:"]:
+            if next_message_candidate.startswith(prefix):
+                next_message_candidate = next_message_candidate[len(prefix):].strip()
+                
         print("\\n=== Debug Info ===")
-        print(f"context: {repr(context)}")
-        print(f"input_ids: {inputs['input_ids'].tolist()}")
-        print(f"input_ids_length: {input_ids_length}")
-        print(f"new_token_ids: {new_token_ids.tolist()}")
+        print(f"prompt (converted context):\\n{prompt}")
         print(f"decoded new_text: {repr(new_text)}")
         print(f"final next_message_candidate: {repr(next_message_candidate)}")
         print("==================\\n")
 
-        # debug changed: 방어적인 fallback 최소화
+        # 결과 텍스트가 완전히 비어있거나, 단순 공백만 있으면 최소한의 점(...)으로 반환
         if not next_message_candidate.strip():
             next_message_candidate = "..."
             
@@ -125,7 +132,7 @@ async def read_root():
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>1:1 Chat Helper (KoGPT2)</title>
+    <title>1:1 Chat Helper (KoAlpaca)</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -227,7 +234,7 @@ async def read_root():
 
 <div class="card">
     <h1>1:1 한국어 채팅 예측용 Helper</h1>
-    <p class="subtitle">KoGPT2 기반 AI 다음 문장 생성 데모</p>
+    <p class="subtitle">대화형 파인튜닝 모델(KoAlpaca) 데모</p>
     
     <div class="form-group">
         <label for="chat-history">나와 상대의 대화 내역</label>
