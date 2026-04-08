@@ -3,15 +3,10 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import torch
-import re
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# [모델 및 토크나이저 상수 명시]
-# 모델 이름과 프롬프트를 이렇게 지정한 이유:
-# base 모델(skt/kogpt2-base-v2)은 사람 간의 대화보다는 위키/문서 형태의 텍스트 생성에 맞춰져 있어 단순 채팅맥락을 이어나가기엔 한계가 있습니다.
-# 이를 대신해, base 모델을 바탕으로 대화/명령(instruction) 데이터셋을 학습시킨 'KoAlpaca' 계열 같은 Chat 전용 모델을 사용하면 
-# "사용자: ~ 봇: ~" 형태의 핑퐁 대화 구조를 명확히 이해하고, 답변을 훨씬 자연스럽고 알맞게 생성해낼 수 있습니다.
-MODEL_NAME = "beomi/KoAlpaca-Polyglot-1.3B"  # 한국어 대화형 모델 (CPU/Local에서 돌릴 수 있는 1.3B 파라미터 경량 챗봇 모델)
+# [모델 명시]
+MODEL_NAME = "heegyu/polyglot-ko-1.3b-chat"
 
 # 전역 변수로 토크나이저와 모델 선언
 tokenizer = None
@@ -37,12 +32,14 @@ async def lifespan(app: FastAPI):
         print("Model loaded successfully!")
     except Exception as e:
         print(f"Failed to load model: {e}")
+        # 예러를 삼키지 않고 그대로 던져서, 모델 로드 실패 원인을 바로 파악할 수 있도록 합니다.
+        raise
     yield
     print("Shutting down and releasing resources.")
     tokenizer = None
     model = None
 
-app = FastAPI(title="1:1 Chat Helper API (KoAlpaca Chat)", lifespan=lifespan)
+app = FastAPI(title="1:1 Chat Helper API", lifespan=lifespan)
 
 class ChatRequest(BaseModel):
     history: list[str]
@@ -55,25 +52,23 @@ async def predict_next(request: ChatRequest):
         return {"next_message": "먼저 대화 내용을 입력해 주세요."}
         
     try:
-        # [프롬프트 변환 로직]
-        # "나: ..." -> "사용자: ..."
-        # "상대: ..." -> "봇: ..."
+        # [프롬프트 구조 변환 로직]
+        # "상대: ..." -> "사용자: ..."
+        # "나: ..." -> "봇: ..."
         converted_history = []
         for line in request.history:
-            if line.startswith("나:"):
-                converted_history.append("사용자: " + line[len("나:"):].strip())
-            elif line.startswith("상대:"):
-                converted_history.append("봇: " + line[len("상대:"):].strip())
+            if line.startswith("상대:"):
+                converted_history.append("사용자: " + line[len("상대:"):].strip())
+            elif line.startswith("나:"):
+                converted_history.append("봇: " + line[len("나:"):].strip())
             else:
                 converted_history.append(line)
                 
-        # 대화형 모델에 맞는 프롬프트 템플릿 구성
-        prompt = "사용자와 챗봇의 대화가 아래와 같다.\\n\\n"
-        prompt += "\\n".join(converted_history)
+        prompt = "\\n".join(converted_history)
         if not prompt.endswith("\\n"):
             prompt += "\\n"
-        # 최종적으로 "내가 다음에 할 말"을 모델이 유추하게 만드므로, "사용자:"를 끝에 배치하여 생성을 유도함.
-        prompt += "사용자:"
+        # "내가 다음에 할 말"을 예측하기 위해 "봇:"을 제일 마지막에 배치
+        prompt += "봇:"
         
         if model is None or tokenizer is None:
             return {"next_message": "현재 AI 모델을 사용할 수 없습니다."}
@@ -86,11 +81,11 @@ async def predict_next(request: ChatRequest):
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=20,          # 과도하게 긴 말뭉치 방지
+                max_new_tokens=20,          
                 do_sample=True,
-                temperature=0.7,            # 너무 높으면 이상한 말 가능성 상승
+                temperature=0.7,            
                 top_p=0.85, 
-                repetition_penalty=1.2,     # 같은 단어 반복 방지
+                repetition_penalty=1.2,     
                 no_repeat_ngram_size=2,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
@@ -103,13 +98,15 @@ async def predict_next(request: ChatRequest):
         # 첫 번째 줄바꿈 전까지만 남기기
         next_message_candidate = new_text.split("\\n")[0].strip()
         
-        # 접두사 중복 생성 제거 (사용자:, 봇:, 나:)
-        for prefix in ["사용자:", "봇:", "나:"]:
+        # 접두사 중복 생성 제거 (사용자:, 봇:, 나:, 상대:)
+        for prefix in ["사용자:", "봇:", "나:", "상대:"]:
             if next_message_candidate.startswith(prefix):
                 next_message_candidate = next_message_candidate[len(prefix):].strip()
                 
         print("\\n=== Debug Info ===")
-        print(f"prompt (converted context):\\n{prompt}")
+        print(f"loaded model name: {MODEL_NAME}")
+        print(f"converted prompt: {repr(prompt)}")
+        print(f"input_ids_length: {input_ids_length}")
         print(f"decoded new_text: {repr(new_text)}")
         print(f"final next_message_candidate: {repr(next_message_candidate)}")
         print("==================\\n")
@@ -121,7 +118,6 @@ async def predict_next(request: ChatRequest):
         return {"next_message": next_message_candidate}
         
     except Exception as e:
-        print(f"Prediction Error: {e}")
         import traceback
         traceback.print_exc()
         return {"next_message": f"추론 중 예외 발생: {e}"}
@@ -132,7 +128,7 @@ async def read_root():
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>1:1 Chat Helper (KoAlpaca)</title>
+    <title>1:1 Chat Helper</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -234,7 +230,7 @@ async def read_root():
 
 <div class="card">
     <h1>1:1 한국어 채팅 예측용 Helper</h1>
-    <p class="subtitle">대화형 파인튜닝 모델(KoAlpaca) 데모</p>
+    <p class="subtitle">Instruction Tuning 모델 채팅 예측 데모</p>
     
     <div class="form-group">
         <label for="chat-history">나와 상대의 대화 내역</label>
