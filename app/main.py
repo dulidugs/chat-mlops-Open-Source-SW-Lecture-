@@ -3,91 +3,102 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import torch
-from transformers import pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# 1. 글로벌 변수로 텍스트 생성 파이프라인 생성 (초기값은 None)
-model_pipeline = None
+# 전역 변수로 토크나이저와 모델 선언
+tokenizer = None
+model = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model_pipeline
+    global tokenizer, model
     try:
-        # 2. 앱 시작 시 한 번만 모델 로드
-        print("Loading Hugging Face model (distilgpt2)...")
-        # CPU 환경에서 동작하도록 가볍고 작은 영문 모델(distilgpt2)를 사용합니다.
-        model_pipeline = pipeline("text-generation", model="distilgpt2", device=-1)
+        print("Loading Hugging Face model (skt/kogpt2-base-v2)...")
+        tokenizer = AutoTokenizer.from_pretrained("skt/kogpt2-base-v2")
+        model = AutoModelForCausalLM.from_pretrained("skt/kogpt2-base-v2")
+        
+        # 모델 재생성시 pad_token_id가 없으면 발생하는 경고를 피하기 위해 설정
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            
+        # GPU 사용 가능 시 cuda로 이동
+        if torch.cuda.is_available():
+            model.to("cuda")
+            
         print("Model loaded successfully!")
     except Exception as e:
         print(f"Failed to load model: {e}")
     yield
-    # 자원 정리
     print("Shutting down and releasing resources.")
-    model_pipeline = None
+    tokenizer = None
+    model = None
 
-# FastAPI 인스턴스 생성
-app = FastAPI(title="1:1 Chat Helper API (MLOps Version)", lifespan=lifespan)
+app = FastAPI(title="1:1 Chat Helper API (KoGPT2)", lifespan=lifespan)
 
-# Pydantic BaseModel 정의
 class ChatRequest(BaseModel):
     history: list[str]
 
-# POST /predict-next 엔드포인트
 @app.post("/predict-next")
 async def predict_next(request: ChatRequest):
-    global model_pipeline
+    global tokenizer, model
     
     if not request.history:
         return {"next_message": "먼저 대화 내용을 입력해 주세요."}
         
     try:
-        # a) history 리스트를 "\\n"으로 join 해서 긴 대화 context 문자열을 만든다.
         context = "\\n".join(request.history)
-        
-        # b) context 끝에 "나:" 프롬프트를 붙여서 다음 할 말을 유도한다.
         if not context.endswith("\\n"):
             context += "\\n"
-        context += "나: "
+        context += "나:"
         
-        # 만약 모델 로드가 실패했다면 fallback 텍스트 반환
-        if model_pipeline is None:
+        if model is None or tokenizer is None:
             return {"next_message": "현재 AI 모델을 사용할 수 없습니다. (Fallback: 그렇구나!)"}
             
-        # c) Hugging Face pipeline을 이용해 생성 (max_new_tokens=30)
-        # 패딩 경고 방지를 위해 pad_token_id 설정, 입력 제한을 피하기 위해 truncation 추가
-        result = model_pipeline(
-            context,
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        inputs = tokenizer(context, return_tensors="pt").to(device)
+        
+        # 한국어 텍스트 생성 옵션 적용 (창의적이면서도 반복 피하기)
+        outputs = model.generate(
+            **inputs,
             max_new_tokens=30,
-            num_return_sequences=1,
-            truncation=True,
-            pad_token_id=model_pipeline.tokenizer.eos_token_id
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=2,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
         )
         
-        generated_text = result[0]['generated_text']
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
-        # d) 입력해 준 context 부분을 잘라내고 새로 생성된 텍스트만 정리한다.
+        # 입력된 프롬프트(context)를 제외한 새로 생성된 부분만 가져오기
         new_text = generated_text[len(context):]
         
-        # 여러 줄이 생성되었을 경우 첫 번째 줄(한 줄)만 가져오고 양쪽 공백 정리
+        # 첫 번째 줄바꿈 전까지만 남기기
         next_message_candidate = new_text.split("\\n")[0].strip()
         
-        if not next_message_candidate:
-            next_message_candidate = "음... 무슨 말을 할지 고민되네."
+        # 간혹 "나:" 또는 유사한 접두사가 다시 생성된 경우 제거
+        if next_message_candidate.startswith("나:"):
+            next_message_candidate = next_message_candidate[2:].strip()
+            
+        # 빈 문자열이거나 이상한 알 수 없는 문자()가 포함된 경우 fallback 반환
+        if not next_message_candidate or "" in next_message_candidate:
+            next_message_candidate = "음... 무슨 말을 해야 할지 잘 모르겠네."
             
         return {"next_message": next_message_candidate}
         
     except Exception as e:
-        # e) 에러 발생 시를 대비한 fallback 문장
         print(f"Prediction Error: {e}")
-        return {"next_message": "요청을 모델로 추론하는 중 오류가 발생했습니다. (Fallback: 무슨 일 있었어?)"}
+        return {"next_message": "추론 중 오류가 발생했습니다. (Fallback: 무슨 일 있었어?)"}
 
-# 이전에 만든 웹 UI (루트 경로 유지)
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     html_content = """<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>1:1 Chat Helper</title>
+    <title>1:1 Chat Helper (KoGPT2)</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -112,7 +123,14 @@ async def read_root():
             text-align: center;
             color: #1c1e21;
             margin-top: 0;
+            margin-bottom: 8px;
+        }
+        p.subtitle {
+            text-align: center;
+            color: #606770;
+            margin-top: 0;
             margin-bottom: 24px;
+            font-size: 0.95rem;
         }
         .form-group {
             margin-bottom: 20px;
@@ -181,7 +199,8 @@ async def read_root():
 <body>
 
 <div class="card">
-    <h1>1:1 Chat Helper</h1>
+    <h1>1:1 한국어 채팅 예측용 Helper</h1>
+    <p class="subtitle">KoGPT2 기반 AI 다음 문장 생성 데모</p>
     
     <div class="form-group">
         <label for="chat-history">나와 상대의 대화 내역</label>
@@ -212,7 +231,6 @@ async function predictNext() {
     resultContainer.style.display = 'none';
     
     try {
-        // POST 요청으로 history 배열 전송 (상대경로 활용)
         const response = await fetch("/predict-next", {
             method: "POST",
             headers: {
@@ -227,7 +245,7 @@ async function predictNext() {
         
         const data = await response.json();
         
-        // 응답 값 말풍선에 렌더링 (나: 추천된 문장 형태)
+        // 응답 값 말풍선에 렌더링
         resultBubble.innerText = `나: ${data.next_message}`;
         resultContainer.style.display = 'block';
     } catch (error) {
