@@ -82,8 +82,11 @@ async def predict_next(request: ChatRequest):
         if next_message_candidate.startswith("나:"):
             next_message_candidate = next_message_candidate[2:].strip()
             
-        # 빈 문자열이거나 이상한 알 수 없는 문자()가 포함된 경우 fallback 반환
-        if not next_message_candidate or "" in next_message_candidate:
+        # [changed / fixed] 
+        # 버그 원인: Python에서는 빈 문자열("")이 모든 문자열의 부분문자열로 평가되므로,
+        # '"" in string'은 항상 True를 반환합니다. 이 때문에 매번 무조건 fallback이 적용되었습니다.
+        # 수정: .strip()을 사용해 공백뿐인 결과를 걸러내고, 유니코드 깨진 문자() 검사를 추가했습니다.
+        if not next_message_candidate.strip() or "" in next_message_candidate:
             next_message_candidate = "음... 무슨 말을 해야 할지 잘 모르겠네."
             
         return {"next_message": next_message_candidate}
