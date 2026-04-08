@@ -52,7 +52,7 @@ async def predict_next(request: ChatRequest):
         context += "나:"
         
         if model is None or tokenizer is None:
-            return {"next_message": "현재 AI 모델을 사용할 수 없습니다. (Fallback: 그렇구나!)"}
+            return {"next_message": "현재 AI 모델을 사용할 수 없습니다."}
             
         device = "cuda" if torch.cuda.is_available() else "cpu"
         inputs = tokenizer(context, return_tensors="pt").to(device)
@@ -82,18 +82,22 @@ async def predict_next(request: ChatRequest):
         if next_message_candidate.startswith("나:"):
             next_message_candidate = next_message_candidate[2:].strip()
             
-        # [changed / fixed] 
-        # 버그 원인: Python에서는 빈 문자열("")이 모든 문자열의 부분문자열로 평가되므로,
-        # '"" in string'은 항상 True를 반환합니다. 이 때문에 매번 무조건 fallback이 적용되었습니다.
-        # 수정: .strip()을 사용해 공백뿐인 결과를 걸러내고, 유니코드 깨진 문자() 검사를 추가했습니다.
-        if not next_message_candidate.strip() or "" in next_message_candidate:
-            next_message_candidate = "음... 무슨 말을 해야 할지 잘 모르겠네."
+        # debug changed: 서버 콘솔에 원본 context, 모델이 실제 만든 전체 텍스트, 필터링 후 텍스트 출력
+        print("\\n=== Debug Info ===")
+        print(f"context: {repr(context)}")
+        print(f"generated_text: {repr(generated_text)}")
+        print(f"next_message_candidate: {repr(next_message_candidate)}")
+        print("==================\\n")
+
+        # debug changed: 방어적인 fallback 제거. 예측 결과가 완전히 비어있을 때만 최소한의 문자열 반환
+        if not next_message_candidate.strip():
+            next_message_candidate = "..."
             
         return {"next_message": next_message_candidate}
         
     except Exception as e:
         print(f"Prediction Error: {e}")
-        return {"next_message": "추론 중 오류가 발생했습니다. (Fallback: 무슨 일 있었어?)"}
+        return {"next_message": f"추론 중 예외 발생: {e}"}
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
