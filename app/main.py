@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import torch
+import re
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # 전역 변수로 토크나이저와 모델 선언
@@ -18,6 +19,7 @@ async def lifespan(app: FastAPI):
         model = AutoModelForCausalLM.from_pretrained("skt/kogpt2-base-v2")
         
         # 모델 재생성시 pad_token_id가 없으면 발생하는 경고를 피하기 위해 설정
+        # debug changed: pad_token_id와 eos_token_id 확인
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             
@@ -57,7 +59,12 @@ async def predict_next(request: ChatRequest):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         inputs = tokenizer(context, return_tensors="pt").to(device)
         
-        # 한국어 텍스트 생성 옵션 적용 (창의적이면서도 반복 피하기)
+        # debug changed: 토큰 길이 기준 자르기를 위해 input_ids의 길이를 저장
+        input_ids_length = inputs["input_ids"].shape[1]
+        
+        # debug changed: skt/kogpt2-base-v2 모델의 특성
+        # 해당 모델은 'base' 모델이므로 채팅 형태나 zero-shot Instruction 명령에 약합니다.
+        # 따라서 확률 기반 생성을 할 때 대화 흐름을 잃고 이상한 문자를 뱉을 확률이 있습니다.
         outputs = model.generate(
             **inputs,
             max_new_tokens=30,
@@ -70,10 +77,11 @@ async def predict_next(request: ChatRequest):
             eos_token_id=tokenizer.eos_token_id
         )
         
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # 입력된 프롬프트(context)를 제외한 새로 생성된 부분만 가져오기
-        new_text = generated_text[len(context):]
+        # debug changed: 기존에는 전체 문장을 decode한 후 문자열 크기 len(context)로 잘랐지만,
+        # 공백이나 특수 토큰 처리 불일치로 인해 문자가 중간에 비정상적으로 잘리며 깨지는 원인이 되었습니다.
+        # 따라서 생성된 토큰 배열에서 입력된 부분만 제외하고 새 토큰만 분리한 후 decode 합니다.
+        new_token_ids = outputs[0][input_ids_length:]
+        new_text = tokenizer.decode(new_token_ids, skip_special_tokens=True)
         
         # 첫 번째 줄바꿈 전까지만 남기기
         next_message_candidate = new_text.split("\\n")[0].strip()
@@ -82,14 +90,24 @@ async def predict_next(request: ChatRequest):
         if next_message_candidate.startswith("나:"):
             next_message_candidate = next_message_candidate[2:].strip()
             
-        # debug changed: 서버 콘솔에 원본 context, 모델이 실제 만든 전체 텍스트, 필터링 후 텍스트 출력
+        # debug changed: 약한 디버깅 보호 로직 (명백한 깨짐만 방어)
+        # 생성된 문자열에 한글이 거의 없고 특수문자나 알파벳만 가득하다면 깨진 것으로 간주합니다.
+        hangul_chars = re.findall(r'[가-힣]', next_message_candidate)
+        if len(next_message_candidate) > 5 and (len(hangul_chars) / len(next_message_candidate)) < 0.2:
+            print(f"[Warning] 한글 비율 낮음 (깨짐 의심): {next_message_candidate}")
+            next_message_candidate = "..."  # 디버깅 단계이므로 최소한의 반환
+            
+        # debug changed: 서버 콘솔에 원본 토큰 등 자세한 디버깅 정보 출력
         print("\\n=== Debug Info ===")
         print(f"context: {repr(context)}")
-        print(f"generated_text: {repr(generated_text)}")
-        print(f"next_message_candidate: {repr(next_message_candidate)}")
+        print(f"input_ids: {inputs['input_ids'].tolist()}")
+        print(f"input_ids_length: {input_ids_length}")
+        print(f"new_token_ids: {new_token_ids.tolist()}")
+        print(f"decoded new_text: {repr(new_text)}")
+        print(f"final next_message_candidate: {repr(next_message_candidate)}")
         print("==================\\n")
 
-        # debug changed: 방어적인 fallback 제거. 예측 결과가 완전히 비어있을 때만 최소한의 문자열 반환
+        # debug changed: 방어적인 fallback 최소화
         if not next_message_candidate.strip():
             next_message_candidate = "..."
             
@@ -97,6 +115,8 @@ async def predict_next(request: ChatRequest):
         
     except Exception as e:
         print(f"Prediction Error: {e}")
+        import traceback
+        traceback.print_exc()
         return {"next_message": f"추론 중 예외 발생: {e}"}
 
 @app.get("/", response_class=HTMLResponse)
